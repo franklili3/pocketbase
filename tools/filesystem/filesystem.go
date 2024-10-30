@@ -8,7 +8,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -21,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/disintegration/imaging"
 	"github.com/gabriel-vasile/mimetype"
+	"github.com/pocketbase/pocketbase/tools/filesystem/internal/s3lite"
 	"github.com/pocketbase/pocketbase/tools/list"
 	"gocloud.dev/blob"
 	"gocloud.dev/blob/fileblob"
@@ -48,25 +48,23 @@ func NewS3(
 
 	cred := credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")
 
-	cfg, err := config.LoadDefaultConfig(ctx,
+	cfg, err := config.LoadDefaultConfig(
+		ctx,
 		config.WithCredentialsProvider(cred),
 		config.WithRegion(region),
-		config.WithEndpointResolverWithOptions(aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-			// ensure that the endpoint has url scheme for
-			// backward compatibility with v1 of the aws sdk
-			prefixedEndpoint := endpoint
-			if !strings.Contains(endpoint, "://") {
-				prefixedEndpoint = "https://" + endpoint
-			}
-
-			return aws.Endpoint{URL: prefixedEndpoint, SigningRegion: region}, nil
-		})),
 	)
 	if err != nil {
 		return nil, err
 	}
 
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		// ensure that the endpoint has url scheme for
+		// backward compatibility with v1 of the aws sdk
+		if !strings.Contains(endpoint, "://") {
+			endpoint = "https://" + endpoint
+		}
+		o.BaseEndpoint = aws.String(endpoint)
+
 		o.UsePathStyle = s3ForcePathStyle
 
 		// Google Cloud Storage alters the Accept-Encoding header,
@@ -77,7 +75,7 @@ func NewS3(
 		}
 	})
 
-	bucket, err := OpenBucketV2(ctx, client, bucketName, nil)
+	bucket, err := s3lite.OpenBucketV2(ctx, client, bucketName, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -276,6 +274,8 @@ func (s *System) Delete(fileKey string) error {
 }
 
 // DeletePrefix deletes everything starting with the specified prefix.
+//
+// The prefix could be subpath (ex. "/a/b/") or filename prefix (ex. "/a/b/file_").
 func (s *System) DeletePrefix(prefix string) []error {
 	failed := []error{}
 
@@ -285,7 +285,14 @@ func (s *System) DeletePrefix(prefix string) []error {
 	}
 
 	dirsMap := map[string]struct{}{}
-	dirsMap[prefix] = struct{}{}
+
+	var isPrefixDir bool
+
+	// treat the prefix as directory only if it ends with trailing slash
+	if strings.HasSuffix(prefix, "/") {
+		isPrefixDir = true
+		dirsMap[strings.TrimRight(prefix, "/")] = struct{}{}
+	}
 
 	// delete all files with the prefix
 	// ---
@@ -303,8 +310,11 @@ func (s *System) DeletePrefix(prefix string) []error {
 
 		if err := s.Delete(obj.Key); err != nil {
 			failed = append(failed, err)
-		} else {
-			dirsMap[path.Dir(obj.Key)] = struct{}{}
+		} else if isPrefixDir {
+			slashIdx := strings.LastIndex(obj.Key, "/")
+			if slashIdx > -1 {
+				dirsMap[obj.Key[:slashIdx]] = struct{}{}
+			}
 		}
 	}
 	// ---
